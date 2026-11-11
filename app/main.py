@@ -1,25 +1,54 @@
+"""RPKI 路由起源核对 Web 应用。
+
+两个 Web 进程（docker compose 中的 web-a / web-b）打开同一个位于
+共享卷上的 SQLite 文件，同步状态与授权数据持久共享。
+"""
+
 from __future__ import annotations
 
-import io
-import logging
+import os
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel
 
-from app.merger import ScanError, scan_docker_archive
-from app.sample import build_demo_archive
-
-logger = logging.getLogger(__name__)
+from app.storage import RPKIStore, VersionInfo
+from app.sync import SyncManager
+from app.validator import ValidationInputError, evaluate
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
+# 固定的可信 RTR 源（手动同步的唯一目标，不接受页面指定其他源）。
+RTR_HOST = os.environ.get("RTR_HOST", "rtr-source")
+RTR_PORT = int(os.environ.get("RTR_PORT", "8210"))
+
+
+def _default_db_path() -> str:
+    for candidate in ("/data/rpki.db", str(BASE_DIR.parent / "data" / "rpki.db")):
+        parent = Path(candidate).parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            probe = parent / ".write-probe"
+            probe.touch()
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+    return str(BASE_DIR.parent / "data" / "rpki.db")
+
+
+DB_PATH = os.environ.get("RPKI_DB_PATH", _default_db_path())
+
+store = RPKIStore(DB_PATH)
+sync_manager = SyncManager(store, RTR_HOST, RTR_PORT)
+
 app = FastAPI(
-    title="镜像 SUID / SGID 审计",
-    description="只读解析 docker save 单镜像 tar，按层合并 whiteout 后定位高权限普通文件。",
+    title="BGP 路由起源 RPKI 核对",
+    description="通过固定可信 RTR 源（RFC 8210 v1 Reset Query）同步 IPv4 授权并核对前缀/ASN。",
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
@@ -41,25 +70,19 @@ async def add_security_headers(request, call_next):
     return response
 
 
-def _scan_error(exc: ScanError) -> HTTPException:
-    return HTTPException(status_code=400, detail=exc.to_detail())
-
-
-async def _scan_upload(upload: UploadFile) -> dict:
-    try:
-        result = await run_in_threadpool(scan_docker_archive, upload.file)
-    except ScanError as exc:
-        raise _scan_error(exc) from exc
-    except Exception as exc:  # defensive: never expose a stack trace to the client
-        logger.exception("Unexpected archive scan failure")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "code": "scan_failed",
-                "message": f"扫描失败：{type(exc).__name__}",
-            },
-        ) from exc
-    return result.as_dict(source="upload")
+def _version_payload(version: VersionInfo | None, now: float) -> dict | None:
+    if version is None:
+        return None
+    return {
+        "version_id": version.version_id,
+        "session_id": version.session_id,
+        "serial": version.serial,
+        "expire_interval": version.expire_interval,
+        "synced_at": version.synced_at,
+        "expires_at": version.expires_at,
+        "roa_count": version.roa_count,
+        "expired": version.is_expired(now),
+    }
 
 
 @app.get("/", include_in_schema=False)
@@ -72,50 +95,89 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/api/scan", summary="扫描上传的 docker save 单镜像 tar")
-@app.post("/scan", include_in_schema=False)
-async def scan_archive(
-    archive: UploadFile | None = File(default=None),
-    image: UploadFile | None = File(default=None),
-    file: UploadFile | None = File(default=None),
-) -> dict:
-    upload = archive or image or file
-    if upload is None:
+@app.get("/api/status", summary="同步状态与当前数据版本")
+async def status() -> dict:
+    now = time.time()
+    version = store.current_version()
+    payload = _version_payload(version, now)
+    usable = payload is not None and not payload["expired"]
+    return {
+        "rtr_source": {"host": RTR_HOST, "port": RTR_PORT},
+        "sync": sync_manager.status.snapshot(),
+        "version": payload,
+        "query_available": usable,
+        "message": (
+            "可以核对"
+            if usable
+            else ("当前授权已过期，无法核对"
+                  if payload is not None
+                  else "尚未同步授权数据，无法核对")
+        ),
+    }
+
+
+@app.post("/api/sync", summary="手动触发 RTR 全量同步（后台执行）")
+async def trigger_sync() -> dict:
+    if not sync_manager.start_sync():
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "sync_in_progress", "message": "已有同步在进行中"},
+        )
+    return {"started": True, "message": "同步已在后台开始，查询不受影响"}
+
+
+class ValidateRequest(BaseModel):
+    prefix: str
+    asn: str | int
+
+
+@app.post("/api/validate", summary="核对 IPv4 前缀与起源 ASN")
+async def validate(request: ValidateRequest) -> dict:
+    now = time.time()
+    version = store.current_version()
+    if version is None:
+        return {
+            "available": False,
+            "state": "Unavailable",
+            "message": "尚未同步授权数据，无法核对，请先执行同步",
+        }
+    if version.is_expired(now):
+        return {
+            "available": False,
+            "state": "Unavailable",
+            "message": "当前授权版本已过期，无法核对，请重新同步",
+            "version": _version_payload(version, now),
+        }
+
+    try:
+        roas = store.load_roas(version.version_id)
+        result = evaluate(request.prefix, request.asn, roas, version)
+    except ValidationInputError as exc:
         raise HTTPException(
             status_code=400,
-            detail={
-                "code": "file_missing",
-                "message": "请上传 docker save 导出的单镜像 tar 文件（表单字段 archive、image 或 file）",
-            },
-        )
-    try:
-        return await _scan_upload(upload)
-    finally:
-        await upload.close()
+            detail={"code": "invalid_input", "message": str(exc)},
+        ) from exc
 
-
-def _scan_demo() -> dict:
-    try:
-        result = scan_docker_archive(io.BytesIO(build_demo_archive()))
-    except ScanError as exc:
-        raise _scan_error(exc) from exc
-    return result.as_dict(source="built-in-demo")
-
-
-@app.get("/api/demo", summary="扫描内置多层示例")
-@app.post("/api/demo", include_in_schema=False)
-async def demo_scan() -> dict:
-    return await run_in_threadpool(_scan_demo)
-
-
-@app.get("/api/demo/archive", summary="下载内置多层示例 tar")
-async def demo_archive() -> Response:
-    payload = await run_in_threadpool(build_demo_archive)
-    return Response(
-        content=payload,
-        media_type="application/x-tar",
-        headers={
-            "Content-Disposition": 'attachment; filename="privilege-audit-demo.tar"',
-            "Content-Length": str(len(payload)),
+    return {
+        "available": True,
+        "state": result.state,
+        "prefix": result.prefix,
+        "asn": result.asn,
+        "reason": result.reason,
+        "covering": [
+            {
+                "prefix": item.prefix,
+                "asn": item.asn,
+                "max_length": item.max_length,
+                "asn_matches": item.asn_matches,
+                "length_allowed": item.length_allowed,
+            }
+            for item in result.covering
+        ],
+        "version": {
+            "version_id": result.version_id,
+            "session_id": result.session_id,
+            "serial": result.serial,
+            "expires_at": result.expires_at,
         },
-    )
+    }

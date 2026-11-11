@@ -1,183 +1,122 @@
-# 镜像 SUID / SGID 审计
+# BGP 路由起源 RPKI 核对
 
-发布镜像前，用一个只读的 Docker 层合并视图找出最终仍带 **SUID** 或 **SGID** 位的普通文件，并定位最后一次写入该文件的镜像层。
+网络运维人员发布 BGP 路由前，核对前缀与起源 ASN 的 RPKI 授权（ROA）。
+系统通过**固定的可信 RTR 源**，仅以 **RFC 8210 v1 Reset Query** 拉取全量
+IPv4 授权（单次最多 1000 条），按 RFC 6483 给出 Valid / Invalid / NotFound
+结论，并展示判定依据与数据版本。
 
-页面使用 FastAPI，上传 `docker save` 导出的**单镜像 tar**，按 `manifest.json` 中 `Layers` 的顺序合并元数据。内置四层示例可直接扫描或下载。
-
-## 快速启动
+## 快速开始
 
 ```bash
+cp .env.example .env          # 可选：调整端口与 expire interval
 docker compose up --build
 ```
 
-打开 <http://localhost:8000>。若 8000 端口被占用：
+启动后：
 
-```bash
-APP_PORT=8080 docker compose up --build
-```
-
-停止：
-
-```bash
-docker compose down
-```
-
-Compose 以非 root 用户运行，容器根文件系统只读，丢弃全部 capabilities，并启用 `no-new-privileges`。上传暂存在容器内 `/tmp` tmpfs 中；归档和层**内容不会被解包**到宿主或容器文件系统。
-
-## 页面功能
-
-- 拖拽或选择 `docker save` 单镜像 tar。
-- 一键扫描内置四层示例。
-- 列出最终 SUID/SGID 普通文件的路径、八进制权限、UID/GID、最后写入层。
-- 显示层顺序、manifest 索引和 layer digest。
-- 错误会明确区分：hardlink 不支持、越界路径、符号链接层引用、多个镜像、无效 manifest 等。
-
-## API
-
-| 方法 | 路径 | 说明 |
+| 服务 | 地址 | 说明 |
 | --- | --- | --- |
-| `GET` | `/` | 网页 |
-| `POST` | `/api/scan` | 上传 tar，表单字段 `archive`（兼容 `image` / `file`） |
-| `GET` | `/api/demo` | 扫描内置示例，返回与上传相同结构 |
-| `GET` | `/api/demo/archive` | 下载内置示例 tar |
-| `GET` | `/api/openapi.json` | OpenAPI 描述 |
-| `GET` | `/healthz` | 健康检查 |
+| Web 进程 A | http://localhost:8000 | 核对页（共享同一份数据库） |
+| Web 进程 B | http://localhost:8001 | 第二个 Web 进程，验证跨进程共享 |
+| RTR 源（协议） | `rtr-source:8210` / 宿主 `localhost:8210` | RFC 8210 v1 TCP |
+| RTR 源（控制口） | http://localhost:8211 | 切换授权集 / 分片 / 断流 |
 
-示例：
+> 两个 Web 进程挂载同一个命名卷 `rpki-data`，SQLite 数据库位于
+> `/data/rpki.db`，以 WAL 模式实现跨进程并发读写与持久共享。
+
+## 网页演示流程
+
+1. 打开 http://localhost:8000，此时**未同步**，页面提示“无法核对”。
+2. 点击「手动同步全量授权」。同步在后台线程进行，页面查询与状态轮询不卡顿
+   （网络等待不阻塞查询）。
+3. 同步完成后，页面显示版本号、RTR 会话号、序号、到期时刻与授权条数。
+4. 输入 IPv4 CIDR 与起源 ASN 进行核对，例如基线数据集：
+
+| 输入 | 预期结论 | 依据 |
+| --- | --- | --- |
+| `198.51.100.0/24` + AS `64500` | Valid | 精确匹配授权，ASN 与 maxLength 均满足 |
+| `198.51.100.64/26` + AS `64500` | Valid | 命中 maxLength=26 的更具体授权 |
+| `198.51.100.0/24` + AS `64999` | Invalid | 有覆盖授权，但 ASN 不匹配 |
+| `8.8.8.0/24` + AS `15169` | NotFound | 无任何 ROA 覆盖该前缀 |
+
+5. 在 8000 与 8001 两个页面分别核对，结论与版本完全一致（同版完整数据）。
+
+### 切换本地 RTR 源行为（控制口 :8211）
 
 ```bash
-curl -sS -F archive=@examples/multilayer-demo.tar \
-  http://localhost:8000/api/scan | jq
+# 查看当前状态
+curl -s localhost:8211/state | python3 -m json.tool
+
+# 切换授权集（baseline / alternate），序号自动递增
+curl -s -X POST localhost:8211/dataset -d '{"dataset":"alternate"}'
+
+# 每个 PDU 拆成 3 字节小 TCP 段发送（验证分片/粘包处理）
+curl -s -X POST localhost:8211/mode -d '{"mode":"fragment"}'
+
+# End of Data 到达前断流 -> 同步失败，页面保留旧版本可继续核对
+curl -s -X POST localhost:8211/mode -d '{"mode":"drop-eod"}'
+
+# 只回 Cache Reset / 发送一半断开 / 回 Error Report
+curl -s -X POST localhost:8211/mode -d '{"mode":"drop-reset"}'
+curl -s -X POST localhost:8211/mode -d '{"mode":"drop-mid"}'
+curl -s -X POST localhost:8211/mode -d '{"mode":"error"}'
+
+# 恢复正常
+curl -s -X POST localhost:8211/mode -d '{"mode":"clean"}'
 ```
 
-响应节选：
+将 `.env` 中 `EXPIRE_INTERVAL` 调小（如 120）后重新 `docker compose up`，
+可在两分钟后观察到“授权已过期，无法核对”。
 
-```json
-{
-  "source": "upload",
-  "image": {"tags": ["demo/privilege-audit:latest"], "config_path": "blobs/sha256/..."},
-  "layers": [
-    {"number": 1, "manifest_index": 0, "path": "blobs/sha256/...", "name": "sha256:..."}
-  ],
-  "files": [
-    {
-      "path": "/usr/bin/ping",
-      "relative_path": "usr/bin/ping",
-      "mode": 2541,
-      "mode_octal": "4755",
-      "permissions": "4755",
-      "uid": 0,
-      "gid": 0,
-      "special_bits": ["SUID"],
-      "file_type": "regular",
-      "last_layer": {
-        "number": 2,
-        "manifest_index": 1,
-        "path": "blobs/sha256/...",
-        "name": "sha256:..."
-      },
-      "layer_number": 2,
-      "layer_manifest_index": 1
-    }
-  ],
-  "summary": {
-    "layers_scanned": 4,
-    "privileged_files": 5,
-    "suid_files": 2,
-    "sgid_files": 3
-  }
-}
+## 判定规则（RFC 6483）
+
+对一条待发布的 IPv4 前缀 P 与起源 ASN A：
+
+- **覆盖授权**：ROA 前缀是 P 的超网，且 ROA 的 `maxLength >= P 的前缀长度`；
+- **Valid**：任一覆盖授权同时满足 `ROA.ASN == A` 且 maxLength 允许该长度；
+- **Invalid**：存在覆盖授权，但没有任何一条同时匹配 ASN 与 maxLength；
+- **NotFound**：不存在任何覆盖授权。
+
+页面会列出全部覆盖授权（前缀、ASN、maxLength、ASN 是否匹配）作为依据，
+并标注结论所依据的版本号、RTR 会话号、序号与到期时刻。
+
+## 一致性与故障语义
+
+- **按 PDU 长度处理 TCP 分片/粘包**：先缓冲字节流，再按公共头部的
+  32 位 `length` 字段切帧；半个 PDU、一次多个 PDU 都能正确重组。
+- **全量合法性门控**：只有从 `Cache Response` 到**同会话** `End of Data`
+  的所有 PDU 全部合法（版本、长度、会话号、序号、计时字段、前缀/ASN
+  范围、无撤回 PDU、无 IPv6、≤1000 条）才落库；任一异常整轮作废。
+- **原子版本写入**：版本行与授权行在单个 SQLite 事务中提交，读者永远
+  只能看到完整的同版数据，不会读到半成品。
+- **断流/错误保留旧版**：同步失败不触碰当前版本，旧版在到期前继续可用。
+- **代际冲突丢弃**：同步开始时记录数据库代际，提交时若当前版本已被另一个
+  Web 进程替换，则丢弃本次结果。
+- **到期时刻**：从 End of Data PDU 完整到达时刻起，按其 `expire` interval
+  计算；过期后查询接口返回“无法核对”。
+- **网络不阻塞查询**：同步在守护线程执行，API 线程池不等待 RTR 网络。
+
+## 目录结构
+
+```
+app/
+  main.py        FastAPI 路由与状态接口
+  rtr.py         RFC 8210 客户端：Reset Query、帧读取、全量校验
+  storage.py     SQLite(WAL) 版本化存储、代际检查、原子提交
+  validator.py   RFC 6483 Valid/Invalid/NotFound 判定与输入校验
+  sync.py        后台同步编排与状态机
+  static/        核对页前端（原生 JS，严格 CSP）
+rtr_source/
+  server.py      本地 RTR 源（RTR TCP + HTTP 控制口，6 种故障模式）
+  Dockerfile
+tests/           48 个 unittest 用例（协议/存储/校验/同步/API）
 ```
 
-- `number` 是便于阅读的 1-based 层号。
-- `manifest_index` 是 `manifest.json` 中 `Layers` 数组的 0-based 下标。
-- `mode` 是权限位整数，`mode_octal` 是补足四位的八进制字符串（如 `4755`）。
-
-错误响应采用 FastAPI 的 `detail` 对象：
-
-```json
-{
-  "detail": {
-    "code": "hardlink_unsupported",
-    "message": "不支持硬链接（hard link）：/hard（层 2）",
-    "path": "/hard",
-    "layer_number": 2,
-    "layer_path": "blobs/sha256/..."
-  }
-}
-```
-
-## 合并规则
-
-1. **严格按 manifest 顺序**逐层应用，先应用较低层，再应用较高层。
-2. **普通 whiteout**（如 `dir/.wh.file`）只从已继承的低层视图中删除 `dir/file` 及其子树。
-3. **opaque whiteout**（`dir/.wh..wh..opq`）只清空低层目录 `dir/` 的内容，目录节点和本层新增内容保留。
-4. **whiteout 与同层新增分离处理**：先对低层应用全部 whiteout，再添加本层条目。因此无论 `.wh.*` 在 tar 中排在本层新文件之前还是之后，结果一致。
-5. **目录/文件互换**：
-   - 上层普通文件、符号链接或特殊文件替换低层目录时，低层整棵子树被遮蔽。
-   - 上层目录替换低层普通文件时，低层文件消失，子项按新层建立。
-6. **符号链接不跟随**：只记录符号链接本身，不解析 `linkname`，更不会把目标文件或链接目标算作普通文件。
-7. **硬链接明确拒绝**：层内出现 hardlink 立即返回 `hardlink_unsupported`，而不是猜测目标元数据。
-8. **越界路径拒绝**：绝对路径、包含 `..` 的路径、NUL 字节路径都会失败，不会静默改写路径。
-
-最终仅列出满足以下条件的条目：
-
-- 类型为普通文件（`regular file`）；
-- 权限位包含 `0o4000`（SUID）或 `0o2000`（SGID）；
-- 未被更高层删除、遮蔽或替换。
-
-## 安全设计
-
-- 只调用 `tarfile` 读取外层归档与内层层 tar 的头/成员流。
-- 没有 `extract()`、`extractall()`，也不会写入任何解包后的文件。
-- 层 tar 通过流式 `r|*` 读取，支持未压缩、gzip、xz、bz2 层。
-- 所有成员路径在合并前校验；符号链接层引用会被拒绝。
-- 不解析符号链接、不跟随硬链接。
-- 服务容器只读、非 root、`cap_drop: ALL`。
-- UI 使用 `textContent` 渲染扫描结果，避免镜像内恶意路径造成 XSS；并设置 CSP。
-
-> 上传文件本身由 ASGI/Starlette 暂存（默认超过 1 MiB 会落到 `/tmp`）。Compose 把 `/tmp` 挂为 tmpfs；这只是上传字节的暂存，不是归档解包。若扫描较大的真实镜像，可通过 `UPLOAD_TMP_SIZE` 调整 tmpfs 大小。
-
-## 本地开发与测试
-
-无需 Docker 的合并逻辑测试：
+## 测试
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
-运行 Web 服务：
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-重新生成内置示例：
-
-```bash
-python3 app/sample.py examples/multilayer-demo.tar
-```
-
-## 目录结构
-
-```text
-app/
-  main.py        FastAPI 路由、上传与错误响应
-  merger.py      只读 tar 解析、层合并、SUID/SGID 收集
-  sample.py      内存中生成四层 docker-save 示例
-  static/        网页、样式和前端逻辑
-examples/        内置示例 tar 与说明
-tests/           合并规则与安全边界测试
-Dockerfile
-docker-compose.yml
-```
-
-## 已知边界
-
-- 仅支持单镜像 `docker save` 格式；多镜像归档会明确拒绝。
-- 硬链接不受支持（按需求明确报错），因此含 hardlink 的镜像不会给出部分结果。
-- 不解析镜像 config 中的 `User`、capabilities 或 seccomp 配置；本工具审计的是文件权限位。
-- 不把文件名解析到容器用户数据库，故 UID/GID 以数字展示。
+协议、存储、校验与同步测试仅依赖标准库；API 端到端测试需要
+`requirements.txt` 中的 FastAPI 环境（容器内自动满足，缺依赖时自动跳过）。

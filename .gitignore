@@ -5,3 +5,13 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.git
+.gitignore
+.dockerignore
+
+# 运行时数据与本地环境配置
+data/
+*.db
+*.db-wal
+*.db-shm
+.env

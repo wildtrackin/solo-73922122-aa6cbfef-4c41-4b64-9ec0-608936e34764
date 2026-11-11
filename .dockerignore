@@ -1,6 +1,3 @@
-.git
-.gitignore
-.dockerignore
 __pycache__
 *.py[cod]
 *.pyo
@@ -11,3 +8,6 @@ tests
 examples
 README.md
 docker-compose.yml
+.env
+data
+rtr_source

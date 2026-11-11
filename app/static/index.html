@@ -1,141 +1,54 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
-  <title>镜像 SUID / SGID 审计</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BGP 路由起源 RPKI 核对</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <header class="hero">
-    <div class="hero-inner">
-      <div class="brand-mark" aria-hidden="true">
-        <span class="brand-dot"></span>
-        <span class="brand-ring"></span>
-      </div>
-      <div class="hero-copy">
-        <p class="eyebrow">Docker Image Privilege Audit</p>
-        <h1>镜像 SUID / SGID 审计</h1>
-        <p class="lede">
-          上传 <code>docker save</code> 导出的单镜像 tar。按 <code>manifest.json</code>
-          的 <code>Layers</code> 顺序只读合并文件元数据，定位最终仍保留高权限位的普通文件。
-        </p>
-        <div class="hero-points" aria-label="安全特性">
-          <span>不落盘解包</span>
-          <span>不跟随符号链接</span>
-          <span>拒绝越界路径</span>
-          <span>精确到写入层</span>
-        </div>
-      </div>
-    </div>
+  <header class="topbar">
+    <h1>BGP 路由起源 RPKI 核对</h1>
+    <p class="subtitle">RFC 8210 v1 Reset Query 全量 IPv4 授权 · RFC 6483 路由起源校验</p>
   </header>
 
-  <main>
-    <section class="panel upload-panel" aria-labelledby="upload-title">
-      <div class="panel-heading">
-        <div>
-          <p class="section-kicker">01 · 输入</p>
-          <h2 id="upload-title">选择镜像归档</h2>
-        </div>
-        <button type="button" class="button button-ghost" id="demo-button">
-          扫描内置多层示例
-        </button>
-      </div>
-
-      <form id="scan-form" novalidate>
-        <label class="drop-zone" id="drop-zone" for="archive-input">
-          <input id="archive-input" name="archive" type="file"
-                 accept=".tar,application/x-tar,application/octet-stream" hidden>
-          <span class="drop-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="34" height="34" role="img">
-              <path d="M12 16V4m0 0-4 4m4-4 4 4M5 14v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"
-                    fill="none" stroke="currentColor" stroke-width="1.7"
-                    stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </span>
-          <span class="drop-title" id="drop-title">拖拽 tar 到这里，或点击选择文件</span>
-          <span class="drop-hint" id="drop-hint">单镜像 docker save tar · 内容仅在内存中解析</span>
-        </label>
-
-        <div class="actions">
-          <span class="file-pill" id="file-pill" hidden></span>
-          <button type="submit" class="button button-primary" id="scan-button" disabled>
-            <span class="button-label">开始扫描</span>
-            <span class="spinner" aria-hidden="true"></span>
-          </button>
-          <a class="button button-link" href="/api/demo/archive" download>
-            下载示例 tar
-          </a>
-        </div>
-      </form>
-
-      <div class="status-box" id="status-box" hidden role="status" aria-live="polite"></div>
-      <div class="error-box" id="error-box" hidden role="alert">
-        <div class="error-heading">
-          <span class="error-icon" aria-hidden="true">!</span>
-          <strong id="error-code">扫描失败</strong>
-        </div>
-        <p id="error-message"></p>
-        <p class="error-meta" id="error-meta" hidden></p>
-      </div>
+  <main class="layout">
+    <section class="card" aria-labelledby="sync-title">
+      <h2 id="sync-title">可信 RTR 源与数据版本</h2>
+      <dl class="meta">
+        <dt>固定可信源</dt><dd id="rtr-endpoint">-</dd>
+        <dt>同步状态</dt><dd id="sync-state">-</dd>
+        <dt>当前版本</dt><dd id="version-info">-</dd>
+        <dt>到期时刻</dt><dd id="version-expiry">-</dd>
+        <dt>授权条数</dt><dd id="version-count">-</dd>
+        <dt>查询可用性</dt><dd id="query-available">-</dd>
+      </dl>
+      <p id="sync-message" class="notice"></p>
+      <button id="sync-button" type="button">手动同步全量授权</button>
     </section>
 
-    <section class="results" id="results" hidden aria-labelledby="results-title">
-      <div class="panel result-head">
-        <div class="panel-heading">
-          <div>
-            <p class="section-kicker">02 · 结果</p>
-            <h2 id="results-title">最终保留特权位的普通文件</h2>
-            <p class="result-subtitle" id="result-subtitle"></p>
-          </div>
-          <div class="summary-cards" aria-label="统计">
-            <div class="metric"><span>扫描层数</span><strong id="metric-layers">0</strong></div>
-            <div class="metric"><span>特权文件</span><strong id="metric-files">0</strong></div>
-            <div class="metric metric-suid"><span>SUID</span><strong id="metric-suid">0</strong></div>
-            <div class="metric metric-sgid"><span>SGID</span><strong id="metric-sgid">0</strong></div>
-          </div>
-        </div>
-        <p class="safety-note" id="safety-note" hidden></p>
-      </div>
-
-      <div class="panel layers-panel">
-        <div class="layers-title-row">
-          <h3>层顺序</h3>
-          <span class="muted">按 manifest.json 的 Layers 数组</span>
-        </div>
-        <ol class="layer-strip" id="layer-strip"></ol>
-      </div>
-
-      <div class="panel table-panel">
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th scope="col">文件路径</th>
-                <th scope="col">八进制权限</th>
-                <th scope="col">特殊位</th>
-                <th scope="col">UID / GID</th>
-                <th scope="col">最后写入层</th>
-              </tr>
-            </thead>
-            <tbody id="findings-body"></tbody>
-          </table>
-        </div>
-        <div class="empty-state" id="empty-state" hidden>
-          <span class="empty-check" aria-hidden="true">✓</span>
-          <h3>未发现 SUID / SGID 普通文件</h3>
-          <p>最终合并视图中没有保留高权限位的普通文件。</p>
-        </div>
-      </div>
+    <section class="card" aria-labelledby="check-title">
+      <h2 id="check-title">前缀 / 起源 ASN 核对</h2>
+      <form id="validate-form">
+        <label for="prefix-input">IPv4 CIDR
+          <input id="prefix-input" name="prefix" type="text"
+                 placeholder="例如 198.51.100.0/24" autocomplete="off" required>
+        </label>
+        <label for="asn-input">起源 ASN
+          <input id="asn-input" name="asn" type="text"
+                 placeholder="例如 64500" autocomplete="off" required>
+        </label>
+        <button type="submit">核对</button>
+      </form>
+      <p id="validate-message" class="notice" role="alert"></p>
+      <div id="validate-result" class="result hidden" aria-live="polite"></div>
     </section>
   </main>
 
   <footer>
-    <p>只读取 tar 头与层内元数据；不会调用解包，也不会将层内容写入宿主文件系统。</p>
-    <p>白名单之外的路径、硬链接和不安全的层引用会被明确拒绝。</p>
+    <small>同步期间不阻塞查询 · 仅完整同版数据可用于核对 · 断流或错误自动保留旧版</small>
   </footer>
 
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

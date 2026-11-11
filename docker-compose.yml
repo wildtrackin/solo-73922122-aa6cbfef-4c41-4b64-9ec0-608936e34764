@@ -1,22 +1,47 @@
 services:
-  privilege-audit:
+  # 本地可信 RTR 源：8210 提供 RFC 8210 协议，8211 提供演示控制接口。
+  rtr-source:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: docker-privilege-audit:local
+      dockerfile: rtr_source/Dockerfile
+    image: rpki-rtr-source:local
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "${RTR_PORT:-8210}:8210"
+      - "${CONTROL_PORT:-8211}:8211"
     environment:
-      TMPDIR: /tmp
-    read_only: true
-    tmpfs:
-      - "/tmp:size=${UPLOAD_TMP_SIZE:-512m},mode=1777"
+      RTR_SERVER_PORT: "8210"
+      CONTROL_PORT: "8211"
+      # 演示用短过期时间可在 .env 中调小（例如 120），观察“已过期无法核对”。
+      EXPIRE_INTERVAL: "${EXPIRE_INTERVAL:-7200}"
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     init: true
     restart: unless-stopped
+
+  # Web 进程 A：与 B 共享同一个命名卷中的 SQLite 数据库。
+  web-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rpki-rpki-web:local
+    ports:
+      - "${WEB_A_PORT:-8000}:8000"
+    environment:
+      RTR_HOST: rtr-source
+      RTR_PORT: "8210"
+      RTR_DB_PATH: /data/rpki.db
+    volumes:
+      - rpki-data:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    depends_on:
+      - rtr-source
     healthcheck:
       test:
         - CMD
@@ -27,3 +52,39 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Web 进程 B：同镜像、同数据库文件，验证跨进程持久共享与代际冲突处理。
+  web-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rpki-rpki-web:local
+    ports:
+      - "${WEB_B_PORT:-8001}:8000"
+    environment:
+      RTR_HOST: rtr-source
+      RTR_PORT: "8210"
+      RTR_DB_PATH: /data/rpki.db
+    volumes:
+      - rpki-data:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    restart: unless-stopped
+    depends_on:
+      - rtr-source
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  rpki-data:
